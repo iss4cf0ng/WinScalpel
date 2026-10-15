@@ -4,27 +4,42 @@
 #define NOMINMAX
 #endif
 
+#ifndef WINVER
+#define WINVER 0x0501
+#endif
+
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0501
 #endif
 
+#include <windows.h>
+
+#include <psapi.h>
+#include <tlhelp32.h>
+#include <winternl.h>
+
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <algorithm>
-
-#include <windows.h>
-#include <tlhelp32.h>
-#include <winternl.h>
+#include <sstream>
 
 #ifdef _WIN64
 #include "hde64.h"
 #else
 #include "hde32.h"
 #endif
+
+typedef BOOL (WINAPI *PFN_GetProcessMitigationPolicy)(
+    HANDLE ProcessHandle,
+    int MitigationPolicy,
+    PVOID lpBuffer,
+    SIZE_T Length
+);
 
 std::string fnBytesToHex(const uint8_t* data, size_t len)
 {
@@ -77,9 +92,536 @@ bool fnMatchPattern(const char* pattern, const char* str)
     return !*pattern && !*str;
 }
 
-std::string fnGetModuleFileVersion(const std::wstring& szFilePath)
+void fnDoModuleExports(const std::string& dllPath)
 {
-    
+    HMODULE hModule = LoadLibraryExA(dllPath.c_str(), NULL, DONT_RESOLVE_DLL_REFERENCES);
+    if (!hModule)
+    {
+        std::cerr << "[-] Error: Failed to load library for export inspection: " << dllPath << "\n";
+        return;
+    }
+
+    uintptr_t baseAddr = (uintptr_t)hModule;
+    IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)baseAddr;
+    IMAGE_NT_HEADERS* ntHeaders = (IMAGE_NT_HEADERS*)(baseAddr + dosHeader->e_lfanew);
+
+    DWORD exportDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    if (exportDirRVA == 0)
+    {
+        std::cout << "[-] Module has no export table.\n";
+        FreeLibrary(hModule);
+        return;
+    }
+
+    IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)(baseAddr + exportDirRVA);
+    DWORD* functions = (DWORD*)(baseAddr + exportDir->AddressOfFunctions);
+    DWORD* names = (DWORD*)(baseAddr + exportDir->AddressOfNames);
+    WORD* ordinals = (WORD*)(baseAddr + exportDir->AddressOfNameOrdinals);
+
+    std::cout << "================================================================================\n";
+    std::cout << " Exports for: " << dllPath << " (Total: " << exportDir->NumberOfNames << " named functions)\n";
+    std::cout << "================================================================================\n";
+    std::cout << " Ordinal | RVA        | Function Name\n";
+    std::cout << "--------------------------------------------------------------------------------\n";
+
+    for (DWORD i = 0; i < exportDir->NumberOfNames; i++)
+    {
+        const char* funcName = (const char*)(baseAddr + names[i]);
+        WORD ordinal = ordinals[i] + exportDir->Base;
+        DWORD funcRVA = functions[ordinals[i]];
+
+        printf(" %-7d | 0x%08X | %s\n", (int)ordinal, (unsigned int)funcRVA, funcName);
+    }
+
+    std::cout << "--------------------------------------------------------------------------------\n\n";
+
+    FreeLibrary(hModule);
+}
+
+void fnDoProcessMitigations(DWORD pid)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess)
+    {
+        std::cerr << "[-] Error: Failed to open process (PID: " << pid << ").\n";
+        return;
+    }
+
+    std::cout << "==================================================\n";
+    std::cout << " Process Mitigation Policies (PID: " << pid << ")\n";
+    std::cout << "==================================================\n";
+
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    auto pGetProcessMitigationPolicy = reinterpret_cast<PFN_GetProcessMitigationPolicy>(
+        GetProcAddress(hKernel32, "GetProcessMitigationPolicy")
+    );
+
+    if (!pGetProcessMitigationPolicy)
+    {
+        std::cout << " [!] Mitigation policy API is not available on this Windows version (Requires Win 8+).\n";
+    }
+    else
+    {
+        // 0 = ProcessDEPPolicy, 1 = ProcessASLRPolicy
+        PROCESS_MITIGATION_DEP_POLICY depPolicy;
+        std::memset(&depPolicy, 0, sizeof(depPolicy));
+        if (pGetProcessMitigationPolicy(hProcess, 0, &depPolicy, sizeof(depPolicy)))
+        {
+            std::cout << " - DEP Enabled    : " << ((depPolicy.Flags & 1) ? "Yes" : "No") << "\n";
+            std::cout << " - DEP Permanent  : " << ((depPolicy.Flags & 2) ? "Yes" : "No") << "\n";
+        }
+        else
+        {
+            std::cout << " - DEP Policy     : <Not Enforced / Unavailable>\n";
+        }
+
+        PROCESS_MITIGATION_ASLR_POLICY aslrPolicy;
+        std::memset(&aslrPolicy, 0, sizeof(aslrPolicy));
+        if (pGetProcessMitigationPolicy(hProcess, 1, &aslrPolicy, sizeof(aslrPolicy)))
+        {
+            std::cout << " - ASLR Randomization : " << ((aslrPolicy.Flags & 1) ? "Yes" : "No") << "\n";
+            std::cout << " - High Entropy VA    : " << ((aslrPolicy.Flags & 2) ? "Yes" : "No") << "\n";
+        }
+        else
+        {
+            std::cout << " - ASLR Policy        : <Not Enforced / Unavailable>\n";
+        }
+    }
+
+    std::cout << "--------------------------------------------------\n\n";
+
+    CloseHandle(hProcess);
+}
+
+void fnDoLoadDllTest(const std::string& dllPath)
+{
+    std::cout << "[*] Attempting to load DLL for analysis: " << dllPath << "\n";
+    HMODULE hModule = LoadLibraryA(dllPath.c_str());
+    if (!hModule)
+    {
+        std::cerr << "[-] Error: Failed to load DLL. Error code: " << GetLastError() << "\n";
+        return;
+    }
+
+    std::cout << "[+] Successfully loaded DLL at base address: 0x" << std::hex << (uintptr_t)hModule << std::dec << "\n";
+    std::cout << "[*] Press ENTER to unload DLL and exit...";
+    std::cin.get();
+
+    FreeLibrary(hModule);
+
+    std::cout << "[*] DLL unloaded successfully.\n";
+}
+
+void fnDoDllInjection(DWORD pid, const std::string& dllPath)
+{
+    char fullPath[MAX_PATH];
+    if (!GetFullPathNameA(dllPath.c_str(), MAX_PATH, fullPath, NULL))
+    {
+        std::cerr << "[-] Error: Invalid DLL path.\n";
+        return;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProcess)
+    {
+        std::cerr << "[-] Error: Failed to open target process PID: " << pid << " (Admin rights required?)\n";
+        return;
+    }
+
+    size_t pathLen = strlen(fullPath) + 1;
+    LPVOID pRemoteBuf = VirtualAllocEx(hProcess, NULL, pathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!pRemoteBuf)
+    {
+        std::cerr << "[-] Error: Failed to allocate memory in target process.\n";
+        CloseHandle(hProcess);
+        return;
+    }
+
+    if (!WriteProcessMemory(hProcess, pRemoteBuf, (LPVOID)fullPath, pathLen, NULL))
+    {
+        std::cerr << "[-] Error: Failed to write DLL path to target process memory.\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return;
+    }
+
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    LPTHREAD_START_ROUTINE pLoadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryA");
+    if (!pLoadLibrary)
+    {
+        std::cerr << "[-] Error: Failed to resolve LoadLibraryA address.\n";
+        VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return;
+    }
+
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, pLoadLibrary, pRemoteBuf, 0, NULL);
+    if (!hThread)
+    {
+        std::cerr << "[-] Error: Failed to create remote thread. Injection failed.\n";
+    }
+    else
+    {
+        std::cout << "[+] Success! DLL injected into PID " << pid << ".\n";
+        WaitForSingleObject(hThread, INFINITE);
+        CloseHandle(hThread);
+    }
+
+    VirtualFreeEx(hProcess, pRemoteBuf, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+}
+
+void fnDoBinToShellcode(const std::string& filePath, const std::string& format)
+{
+    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+    if (!file.is_open())
+    {
+        std::cerr << "[-] Error: Failed to open file: " << filePath << std::endl;
+        return;
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<unsigned char> buffer(static_cast<size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size))
+    {
+        std::cerr << "[-] Error: Failed to read file: " << filePath << std::endl;
+        return;
+    }
+    file.close();
+
+    std::cout << "[*] Converting file: " << filePath << " (" << size << " bytes) -> Format: " << format << "\n\n";
+
+    if (format == "python" || format == "py")
+    {
+        std::cout << "shellcode = b\"\"\n";
+        for (size_t i = 0; i < buffer.size(); i++)
+        {
+            if (i % 16 == 0)
+            {
+                if (i > 0) std::cout << "\"\n";
+                std::cout << "shellcode += b\"";
+            }
+            std::printf("\\x%02X", buffer[i]);
+        }
+        if (!buffer.empty()) std::cout << "\"\n";
+    }
+    else if (format == "c" || format == "cpp")
+    {
+        std::cout << "unsigned char shellcode[] = {\n    ";
+        for (size_t i = 0; i < buffer.size(); i++)
+        {
+            std::printf("0x%02X", buffer[i]);
+            if (i != buffer.size() - 1)
+            {
+                std::cout << ", ";
+            }
+            if ((i + 1) % 12 == 0)
+            {
+                std::cout << "\n    ";
+            }
+        }
+        std::cout << "\n};\n";
+        std::cout << "unsigned int shellcode_len = " << buffer.size() << ";\n";
+    }
+    else 
+    {
+        std::cout << "\"";
+        for (size_t i = 0; i < buffer.size(); i++)
+        {
+            std::printf("\\x%02X", buffer[i]);
+        }
+        std::cout << "\"\n";
+    }
+    std::cout << "\n";
+}
+
+void fnDoModuleSectionsInspect(DWORD pid, const std::string& targetModule)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess)
+    {
+        std::cerr << "[-] Error: Failed to open process (PID: " << pid << "). Need Admin rights?\n";
+        return;
+    }
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    if (!EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded))
+    {
+        std::cerr << "[-] Error: Failed to enumerate modules.\n";
+        CloseHandle(hProcess);
+        return;
+    }
+
+    int moduleCount = cbNeeded / sizeof(HMODULE);
+    bool found = false;
+
+    for (int i = 0; i < moduleCount; i++)
+    {
+        wchar_t szModName[MAX_PATH];
+        if (GetModuleFileNameExW(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(wchar_t)))
+        {
+            std::wstring ws(szModName);
+            std::string modPath(ws.begin(), ws.end());
+            
+            size_t lastSlash = modPath.find_last_of("\\/");
+            std::string fileName = (lastSlash != std::string::npos) ? modPath.substr(lastSlash + 1) : modPath;
+
+            if (_stricmp(fileName.c_str(), targetModule.c_str()) == 0)
+            {
+                found = true;
+                MODULEINFO modInfo;
+                if (!GetModuleInformation(hProcess, hMods[i], &modInfo, sizeof(MODULEINFO)))
+                    continue;
+
+                uintptr_t baseAddr = (uintptr_t)modInfo.lpBaseOfDll;
+
+                IMAGE_DOS_HEADER dosHeader;
+                IMAGE_NT_HEADERS ntHeaders;
+                SIZE_T bytesRead = 0;
+
+                if (!ReadProcessMemory(hProcess, (LPCVOID)baseAddr, &dosHeader, sizeof(dosHeader), &bytesRead) ||
+                    dosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+                {
+                    std::cerr << "[-] Error: Invalid DOS header.\n";
+                    break;
+                }
+
+                if (!ReadProcessMemory(hProcess, (LPCVOID)(baseAddr + dosHeader.e_lfanew), &ntHeaders, sizeof(ntHeaders), &bytesRead))
+                {
+                    std::cerr << "[-] Error: Invalid NT headers.\n";
+                    break;
+                }
+
+                WORD numSections = ntHeaders.FileHeader.NumberOfSections;
+                uintptr_t sectionHeadersAddr = baseAddr + dosHeader.e_lfanew + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
+
+                std::vector<IMAGE_SECTION_HEADER> sections(numSections);
+                if (!ReadProcessMemory(hProcess, (LPCVOID)sectionHeadersAddr, sections.data(), numSections * sizeof(IMAGE_SECTION_HEADER), &bytesRead))
+                {
+                    std::cerr << "[-] Error: Failed to read section headers.\n";
+                    break;
+                }
+
+                std::cout << "================================================================================\n";
+                std::cout << " PE Sections for: " << fileName << " (Base: 0x" << std::hex << baseAddr << std::dec << ")\n";
+                std::cout << "================================================================================\n";
+                std::cout << " Name     | Virtual Addr     | Virt Size  | Raw Size   | Perms | Characteristics\n";
+                std::cout << "--------------------------------------------------------------------------------\n";
+
+                for (int s = 0; s < numSections; s++)
+                {
+                    char name[9] = {0};
+                    memcpy(name, sections[s].Name, 8);
+
+                    uintptr_t virtAddr = baseAddr + sections[s].VirtualAddress;
+                    DWORD virtSize = sections[s].Misc.VirtualSize;
+                    DWORD rawSize = sections[s].SizeOfRawData;
+                    DWORD chars = sections[s].Characteristics;
+
+                    char perms[5] = "----";
+                    if (chars & IMAGE_SCN_MEM_READ)    perms[0] = 'R';
+                    if (chars & IMAGE_SCN_MEM_WRITE)   perms[1] = 'W';
+                    if (chars & IMAGE_SCN_MEM_EXECUTE) perms[2] = 'X';
+                    perms[3] = '\0';
+
+#ifdef _WIN64
+                    printf(" %-8s | 0x%016llX | 0x%08X | 0x%08X | %-5s | 0x%08X\n",
+                        name, (unsigned long long)virtAddr, (unsigned int)virtSize, (unsigned int)rawSize, perms, (unsigned int)chars);
+#else
+                    printf(" %-8s | 0x%08X         | 0x%08X | 0x%08X | %-5s | 0x%08X\n",
+                        name, (unsigned int)virtAddr, (unsigned int)virtSize, (unsigned int)rawSize, perms, (unsigned int)chars);
+#endif
+                }
+
+                std::cout << "--------------------------------------------------------------------------------\n\n";
+                break;
+            }
+        }
+    }
+
+    if (!found)
+    {
+        std::cerr << "[-] Module '" << targetModule << "' not found in PID " << pid << ".\n";
+    }
+
+    CloseHandle(hProcess);
+}
+
+std::string fnGetModuleFileVersion(const std::wstring& filePath)
+{
+    DWORD dummy = 0;
+    DWORD infoSize = GetFileVersionInfoSizeW(filePath.c_str(), &dummy);
+    if (infoSize == 0) return "Unknown";
+
+    std::vector<BYTE> verData(infoSize);
+    if (!GetFileVersionInfoW(filePath.c_str(), 0, infoSize, verData.data()))
+        return "Unknown";
+
+    VS_FIXEDFILEINFO* fileInfo = nullptr;
+    UINT len = 0;
+    if (VerQueryValueW(verData.data(), L"\\", (LPVOID*)&fileInfo, &len) && fileInfo)
+    {
+        DWORD ms = fileInfo->dwFileVersionMS;
+        DWORD ls = fileInfo->dwFileVersionLS;
+        char buf[64];
+        sprintf_s(buf, "%d.%d.%d.%d", 
+            (ms >> 16) & 0xFFFF, ms & 0xFFFF, 
+            (ls >> 16) & 0xFFFF, ls & 0xFFFF);
+        return std::string(buf);
+    }
+    return "Unknown";
+}
+
+void fnDoModuleSecurityInspect(DWORD pid, const std::string& targetModulesArg)
+{
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess)
+    {
+        std::cerr << "[-] Error: Failed to open process (PID: " << pid << "). Need Admin rights?\n";
+        return;
+    }
+
+    std::vector<std::string> targetList;
+    bool inspectAll = true;
+
+    if (!targetModulesArg.empty() && targetModulesArg != "all")
+    {
+        inspectAll = false;
+        std::stringstream ss(targetModulesArg);
+        std::string item;
+        while (std::getline(ss, item, ','))
+        {
+            size_t start = item.find_first_not_of(" \t");
+            size_t end = item.find_last_not_of(" \t");
+            if (start != std::string::npos && end != std::string::npos)
+            {
+                targetList.push_back(item.substr(start, end - start + 1));
+            }
+        }
+    }
+
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    if (!EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL))
+    {
+        std::cerr << "[-] Error: Failed to enumerate modules.\n";
+        CloseHandle(hProcess);
+        return;
+    }
+
+    int moduleCount = cbNeeded / sizeof(HMODULE);
+    int printedCount = 0;
+
+    for (int i = 0; i < moduleCount; i++)
+    {
+        wchar_t szModName[MAX_PATH];
+        if (GetModuleFileNameExW(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(wchar_t)))
+        {
+            std::wstring ws(szModName);
+            std::string modPath(ws.begin(), ws.end());
+            
+            size_t lastSlash = modPath.find_last_of("\\/");
+            std::string fileName = (lastSlash != std::string::npos) ? modPath.substr(lastSlash + 1) : modPath;
+
+            bool match = inspectAll;
+            if (!match)
+            {
+                for (const auto& t : targetList)
+                {
+                    if (_stricmp(fileName.c_str(), t.c_str()) == 0)
+                    {
+                        match = true;
+                        break;
+                    }
+                }
+            }
+
+            if (match)
+            {
+                printedCount++;
+                MODULEINFO modInfo;
+                if (!GetModuleInformation(hProcess, hMods[i], &modInfo, sizeof(MODULEINFO)))
+                    continue;
+
+                uintptr_t baseAddr = (uintptr_t)modInfo.lpBaseOfDll;
+                DWORD size = modInfo.SizeOfImage;
+                uintptr_t topAddr = baseAddr + size;
+
+                IMAGE_DOS_HEADER dosHeader;
+                IMAGE_NT_HEADERS ntHeaders;
+                SIZE_T bytesRead = 0;
+
+                if (!ReadProcessMemory(hProcess, (LPCVOID)baseAddr, &dosHeader, sizeof(dosHeader), &bytesRead) ||
+                    dosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+                {
+                    std::cout << "[!] Could not read DOS header for " << fileName << "\n";
+                    continue;
+                }
+
+                if (!ReadProcessMemory(hProcess, (LPCVOID)(baseAddr + dosHeader.e_lfanew), &ntHeaders, sizeof(ntHeaders), &bytesRead))
+                {
+                    std::cout << "[!] Could not read NT headers for " << fileName << "\n";
+                    continue;
+                }
+
+                WORD dllChars = ntHeaders.OptionalHeader.DllCharacteristics;
+                
+                bool hasASLR = (dllChars & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0;
+                bool hasNX = (dllChars & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0;
+                bool canRebase = (ntHeaders.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) == 0;
+                
+                bool hasSafeSEH = false;
+                #ifndef _WIN64
+                bool noSEH = (dllChars & IMAGE_DLLCHARACTERISTICS_NO_SEH) != 0;
+                if (!noSEH && ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG].Size > 0)
+                {
+                    hasSafeSEH = true; 
+                }
+                #else
+                hasSafeSEH = true;
+                #endif
+
+                bool isOSDll = (modPath.find("System32") != std::string::npos || 
+                                modPath.find("SysWOW64") != std::string::npos ||
+                                modPath.find("winsxs") != std::string::npos);
+
+                std::string version = fnGetModuleFileVersion(szModName);
+
+                std::cout << "==================================================\n";
+                std::cout << " Module Name : " << fileName << "\n";
+                std::cout << " Path        : " << modPath << "\n";
+                std::cout << "==================================================\n";
+#ifdef _WIN64
+                std::cout << " Base Address: 0x" << std::hex << std::setw(16) << std::setfill('0') << baseAddr << "\n";
+                std::cout << " Top Address : 0x" << std::hex << std::setw(16) << std::setfill('0') << topAddr << "\n";
+#else
+                std::cout << " Base Address: 0x" << std::hex << std::setw(8) << std::setfill('0') << baseAddr << "\n";
+                std::cout << " Top Address : 0x" << std::hex << std::setw(8) << std::setfill('0') << topAddr << "\n";
+#endif
+                std::cout << std::dec;
+                std::cout << " Size        : " << size << " bytes (" << (size / 1024) << " KB)\n";
+                std::cout << "--------------------------------------------------\n";
+                std::cout << " [Mitigations & Properties]\n";
+                std::cout << "  - ASLR     : " << (hasASLR ? "[+] Enabled" : "[-] Disabled") << "\n";
+                std::cout << "  - NXCompat : " << (hasNX ? "[+] Enabled" : "[-] Disabled") << "\n";
+                std::cout << "  - Rebase   : " << (canRebase ? "[+] Yes (Relocatable)" : "[-] No (Fixed Base)") << "\n";
+                std::cout << "  - SafeSEH  : " << (hasSafeSEH ? "[+] Enabled/N/A" : "[-] Disabled/Vulnerable") << "\n";
+                std::cout << "  - OS DLL   : " << (isOSDll ? "Yes (System DLL)" : "No (Third-party/App)") << "\n";
+                std::cout << "  - Version  : " << version << "\n";
+                std::cout << "--------------------------------------------------\n\n";
+            }
+        }
+    }
+
+    if (!inspectAll && printedCount == 0)
+    {
+        std::cout << "[-] None of the specified modules were found in PID " << pid << ".\n";
+    }
+
+    CloseHandle(hProcess);
 }
 
 std::string fnFindApiNameByAddress(HMODULE hModule, uintptr_t targetAddr)
@@ -781,14 +1323,52 @@ void fnPrintUsage(const char* programName)
     std::cout << std::endl;
     std::cout << "WinScalpel - Lightweight Offline Disassembler & Analysis Tool (XP Compatible)\n\n";
     std::cout << "Usage Modes:\n";
-    std::cout << "  0. Coffee:                " << prog << " --coffee\n";
-    std::cout << "  1. Disassembly:           " << prog << " --da [ModulePath] [ApiName] [LineCount]\n";
-    std::cout << "  2. Symbol Search:         " << prog << " --search [Module!Pattern] [--line [LineCount]]\n";
-    std::cout << "  3. Process Memory Dump:   " << prog << " --dump [Address] --pid [PID] [--line [LineCount]]\n";
-    std::cout << "  4. Process Stack Dump:    " << prog << " --stack --pid [PID] [--line [LineCount]]\n";
-    std::cout << "  5. Process Info:          " << prog << " --info --pid [PID]\n";
-    std::cout << "  6. Process Modules:       " << prog << " --modules --pid [PID]\n";
-    std::cout << "  7. DEP Bypass/Test (1-6)  " << prog << " --dep [1-6]\n";
+
+    std::cout << "  0. Coffee - Easter egg\n";
+    std::cout << "     Usage: " << prog << " --coffee\n\n";
+
+    std::cout << "  1. Disassembly - Disassemble machine code from a module API\n";
+    std::cout << "     Usage: " << prog << " --da [ModulePath] [ApiName] [LineCount]\n\n";
+
+    std::cout << "  2. Symbol Search - Search symbols or patterns in a module\n";
+    std::cout << "     Usage: " << prog << " --search [Module!Pattern] [--line [LineCount]]\n\n";
+
+    std::cout << "  3. Process Memory Dump - Dump process memory at specified address\n";
+    std::cout << "     Usage: " << prog << " --dump [Address] --pid [PID] [--line [LineCount]]\n\n";
+
+    std::cout << "  4. Process Stack Dump - Dump process stack contents\n";
+    std::cout << "     Usage: " << prog << " --stack --pid [PID] [--line [LineCount]]\n\n";
+
+    std::cout << "  5. Process Info - Show detailed process information\n";
+    std::cout << "     Usage: " << prog << " --info --pid [PID]\n\n";
+
+    std::cout << "  6. Process Modules - List all loaded modules in a process\n";
+    std::cout << "     Usage: " << prog << " --modules --pid [PID]\n\n";
+
+    std::cout << "  7. DEP Bypass/Test - Test different DEP bypass techniques (1-6)\n";
+    std::cout << "     Usage: " << prog << " --dep [1-6]\n\n";
+
+    std::cout << "  8. Module Security Inspect - Check ASLR, DEP, SafeSEH, Rebase, Version\n";
+    std::cout << "     Usage: " << prog << " --mod-info [module1.dll,module2.dll] --pid [PID]\n\n";
+
+    std::cout << "  9. PE Sections Inspect - Inspect PE section perms (RX/RWX/RO)\n";
+    std::cout << "     Usage: " << prog << " --sections [Module] --pid [PID]\n\n";
+
+    std::cout << " 10. Bin to Shellcode - Convert binary files into Python/C/Raw formats\n";
+    std::cout << "     Usage: " << prog << " --bin2sc [FilePath] [--format python|c|raw]\n\n";
+
+    std::cout << " 11. Module Exports - Inspect EAT of a DLL file\n";
+    std::cout << "     Usage: " << prog << " --exports [DllPath]\n\n";
+
+    std::cout << " 12. Process Mitigations - Check process-level security policies\n";
+    std::cout << "     Usage: " << prog << " --mitigations --pid [PID]\n\n";
+
+    std::cout << " 13. Load DLL Test - Manually load a DLL for malware/API testing\n";
+    std::cout << "     Usage: " << prog << " --load-dll [DllPath]\n\n";
+
+    std::cout << " 14. DLL Injection - Inject a DLL into a target process for patching\n";
+    std::cout << "     Usage: " << prog << " --inject [DllPath] --pid [PID]\n";
+
     std::cout << std::endl;
 }
 
@@ -869,6 +1449,7 @@ int main(int argc, char *argv[])
     size_t lineCount = 0;
     uintptr_t dumpAddr = 0;
     int max_line = 100;
+    std::string outputFormat = "raw";
 
     for (int i = 2; i < argc; i++)
     {
@@ -897,6 +1478,10 @@ int main(int argc, char *argv[])
                 std::cerr << "Error: Invalid --line value.\n";
                 return 1;
             }
+        }
+        else if (arg == "--format" && i + 1 < argc)
+        {
+            outputFormat = argv[++i];
         }
     }
 
@@ -1189,6 +1774,87 @@ int main(int argc, char *argv[])
         std::cout << "[*] Disassembly finished\n";
 
         FreeLibrary(hModule);
+        return 0;
+    }
+    else if (arg1 == "--mod-info")
+    {
+        if (pid == 0)
+        {
+            std::cerr << "Error: --mod-info requires --pid N\n";
+            return 1;
+        }
+
+        std::string targetMods = "all";
+        if (argc >= 3 && argv[2][0] != '-')
+        {
+            targetMods = argv[2];
+        }
+
+        fnDoModuleSecurityInspect(pid, targetMods);
+        return 0;
+    }
+    else if (arg1 == "--sections")
+    {
+        if (argc < 3 || pid == 0)
+        {
+            std::cerr << "Error: --sections requires [ModulePath] and --pid N\n";
+            return 1;
+        }
+
+        fnDoModuleSectionsInspect(pid, argv[2]);
+
+        return 0;
+    }
+    else if (arg1 == "--bin2sc")
+    {
+        if (argc < 3)
+        {
+            std::cerr << "Error: --bin2sc requires a target file path.\n";
+            return 1;
+        }
+
+        fnDoBinToShellcode(argv[2], outputFormat);
+        return 0;
+    }
+    else if (arg1 == "--exports")
+    {
+        if (argc < 3)
+        {
+            std::cerr << "Error: --exports requires a DLL path.\n";
+            return 1;
+        }
+        fnDoModuleExports(argv[2]);
+        return 0;
+    }
+    else if (arg1 == "--mitigations")
+    {
+        if (pid == 0)
+        {
+            std::cerr << "Error: --mitigations requires --pid N\n";
+            return 1;
+        }
+        fnDoProcessMitigations(pid);
+        return 0;
+    }
+    else if (arg1 == "--load-dll")
+    {
+        if (argc < 3)
+        {
+            std::cerr << "Error: --load-dll requires a DLL path.\n";
+            return 1;
+        }
+        fnDoLoadDllTest(argv[2]);
+        return 0;
+    }
+    else if (arg1 == "--inject")
+    {
+        if (argc < 3 || pid == 0)
+        {
+            std::cerr << "Error: --inject requires [DllPath] and --pid N\n";
+            return 1;
+        }
+        
+        fnDoDllInjection(pid, argv[2]);
         return 0;
     }
 
