@@ -505,7 +505,30 @@ void fnDoModuleSecurityInspect(DWORD pid, const std::string& targetModulesArg)
 
     HMODULE hMods[1024];
     DWORD cbNeeded;
-    if (!EnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL))
+    bool enumSuccess = false;
+
+    HMODULE hPsapi = LoadLibraryA("psapi.dll");
+    if (hPsapi)
+    {
+        typedef BOOL (WINAPI *PFN_EnumProcessModulesEx)(HANDLE, HMODULE*, DWORD, LPDWORD, DWORD);
+        auto pEnumProcessModulesEx = (PFN_EnumProcessModulesEx)GetProcAddress(hPsapi, "EnumProcessModulesEx");
+
+        if (pEnumProcessModulesEx)
+        {
+            enumSuccess = pEnumProcessModulesEx(hProcess, hMods, sizeof(hMods), &cbNeeded, LIST_MODULES_ALL);
+        }
+        else
+        {
+            enumSuccess = EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded);
+        }
+        FreeLibrary(hPsapi);
+    }
+    else
+    {
+        enumSuccess = EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded);
+    }
+
+    if (!enumSuccess)
     {
         std::cerr << "[-] Error: Failed to enumerate modules.\n";
         CloseHandle(hProcess);
@@ -1087,14 +1110,27 @@ void fnDoProcessInfo(DWORD pid)
         std::cout << " Session ID    : Session " << sessionId << (sessionId == 0 ? " (Services / System)" : " (User)") << "\n";
     }
 
-    typedef BOOL(WINAPI* PFN_IsProcessCritical)(HANDLE, PBOOL);
-    auto pIsProcessCritical = reinterpret_cast<PFN_IsProcessCritical>(GetProcAddress(hKernel32, "IsProcessCritical"));
-    if (pIsProcessCritical)
+    HMODULE hNtDll = GetModuleHandleA("ntdll.dll");
+    if (hNtDll)
     {
-        BOOL isCritical = FALSE;
-        if (pIsProcessCritical(hProcess, &isCritical))
+        typedef NTSTATUS (WINAPI *pNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        auto NtQueryQueryInformationProcess = (pNtQueryInformationProcess)GetProcAddress(hNtDll, "NtQueryInformationProcess");
+        
+        if (NtQueryQueryInformationProcess)
         {
-            std::cout << " Critical      : " << (isCritical ? "YES (Protected System Process)" : "No") << "\n";
+            ULONG breakOnTermination = 0;
+            NTSTATUS status = NtQueryQueryInformationProcess(
+                hProcess, 
+                29, // ProcessBreakOnTermination
+                &breakOnTermination, 
+                sizeof(ULONG), 
+                NULL
+            );
+            
+            if (status == 0) // STATUS_SUCCESS
+            {
+                std::cout << " Critical      : " << (breakOnTermination != 0 ? "YES (Protected / Critical)" : "No") << "\n";
+            }
         }
     }
 
@@ -1214,6 +1250,47 @@ void fnDoProcessModules(DWORD pid)
     }
 
     std::cout << separator << "\n";
+}
+
+void fnDoSetCriticalStatus(DWORD nCriticalStatus, DWORD pid)
+{
+    typedef NTSTATUS (WINAPI *pNtSetInformationProcess)(HANDLE, ULONG, PVOID, ULONG);
+    HMODULE hNtDll = GetModuleHandleA("ntdll.dll");
+
+    if (!hNtDll)
+    {
+        std::cerr << "[-] Invalid handle value of hNtDll." << std::endl;
+        return;
+    }
+
+    auto NtSetInformationProcess = (pNtSetInformationProcess)(void*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+    if (!NtSetInformationProcess)
+    {
+        std::cout << "[-] Failed to get API address. Error: " << GetLastError() << std::endl;
+        return;
+    }
+
+    ULONG executeFlags = 2;
+    NtSetInformationProcess((HANDLE)-1, 0x22, &executeFlags, sizeof(executeFlags));
+
+    HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+    if (!hProcess)
+    {
+        std::cout << "[-] Failed to open process. Error: " << GetLastError() << std::endl;
+        return;
+    }
+
+    ULONG nIsCritical = nCriticalStatus;
+    ULONG nProcInfoClass = 29;
+
+    NTSTATUS status = NtSetInformationProcess(hProcess, nProcInfoClass, &nIsCritical, sizeof(ULONG));
+    if (0 == status)
+        printf("[+] Success! Process %lu is now %s\n", pid, nIsCritical == 1 ? "CRITICAL" : "NORMAL");
+    else
+        printf("[-] Failed. NTSTATUS: 0x%lX (Check if running as Admin)\n", status);
+
+    CloseHandle(hProcess);
+    CloseHandle(hNtDll);
 }
 
 void fnDoDepTest(int method)
@@ -1367,7 +1444,10 @@ void fnPrintUsage(const char* programName)
     std::cout << "     Usage: " << prog << " --load-dll [DllPath]\n\n";
 
     std::cout << " 14. DLL Injection - Inject a DLL into a target process for patching\n";
-    std::cout << "     Usage: " << prog << " --inject [DllPath] --pid [PID]\n";
+    std::cout << "     Usage: " << prog << " --inject [DllPath] --pid [PID]\n\n";
+
+    std::cout << " 15. Critical Process - Set critical process status\n";
+    std::cout << "     Usage: " << prog << " --set-critical [0|1] --pid [PID]\n";
 
     std::cout << std::endl;
 }
@@ -1450,8 +1530,9 @@ int main(int argc, char *argv[])
     uintptr_t dumpAddr = 0;
     int max_line = 100;
     std::string outputFormat = "raw";
+    DWORD critical_status = 0;
 
-    for (int i = 2; i < argc; i++)
+    for (int i = 1; i < argc; i++)
     {
         std::string arg = argv[i];
 
@@ -1482,6 +1563,18 @@ int main(int argc, char *argv[])
         else if (arg == "--format" && i + 1 < argc)
         {
             outputFormat = argv[++i];
+        }
+        else if (arg == "--set-critical" && i + 1 < argc)
+        {
+            try
+            {
+                critical_status = std::stoi(argv[++i]);
+            }
+            catch (...)
+            {
+                std::cerr << "Error: Invalid --set-critical value.\n";
+                return 1;
+            }
         }
     }
 
@@ -1855,6 +1948,17 @@ int main(int argc, char *argv[])
         }
         
         fnDoDllInjection(pid, argv[2]);
+        return 0;
+    }
+    else if (arg1 == "--set-critical")
+    {
+        if (argc < 3 || pid == 0)
+        {
+            std::cerr << "Error: --set-critical requires [0|1] and --pid N\n";
+            return 1;
+        }
+
+        fnDoSetCriticalStatus(critical_status, pid);
         return 0;
     }
 
