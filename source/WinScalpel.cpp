@@ -1770,10 +1770,10 @@ void fnPrintUsage(const char* programName)
     std::cout << " 15. Critical Process - Set critical process status\n";
     std::cout << "     Usage: " << prog << " --set-critical [0|1] --pid [PID]\n\n";
 
-    std::cout << " 16. Dump Process - Set critical process status\n";
+    std::cout << " 16. Dump Process - Dump process from memory and save it into a file\n";
     std::cout << "     Usage: " << prog << " --dump-proc --pid [PID] --output-path [Path]\n\n";
 
-    std::cout << " 17. Display MFT - Set critical process status\n";
+    std::cout << " 17. Display MFT - Display MFT information with a specified index\n";
     std::cout << "     Usage: " << prog << " --mft-read \\\\.\\C: --mft-index [Index]\n\n";
 
     std::cout << " 18. Hexdump - Display file hexdump\n";
@@ -2324,7 +2324,7 @@ int main(int argc, char *argv[])
     }
     else if (arg1 == "--mft-read")
     {
-        if (argc < 4)
+        if (argc < 5)
         {
             std::cerr << "[-] Usage: " << argv[0] << " --mft-read \\\\.\\C: --mft-index 0" << std::endl;
             return 1;
@@ -2335,9 +2335,10 @@ int main(int argc, char *argv[])
     }
     else if (arg1 == "--hexdump")
     {
-        if (argc < 4)
+        if (argc < 3)
         {
-
+            std::cerr << "[-] Usage: " << argv[0] << " --hexdump [File]" << std::endl;
+            return 1;
         }
 
         LPCTSTR lpFilename = inputFile.c_str();
