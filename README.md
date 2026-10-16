@@ -6,7 +6,15 @@ The idea for this tool came to me while I was developing a ROP script. It allows
 
 I also integrated several features into it that can be helpful when analyzing malware or Windows APIs.
 
-# Usage
+# Build Project
+
+```bash
+git clone git@github.com:iss4cf0ng/WinScalpel
+cd WinScalpel
+make
+```
+
+# Usage and Features
 
 Winscalpel currently contains the features below:
 
