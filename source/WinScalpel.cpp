@@ -17,6 +17,7 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <winternl.h>
+#include <dbghelp.h>
 
 #include <iostream>
 #include <fstream>
@@ -40,6 +41,31 @@ typedef BOOL (WINAPI *PFN_GetProcessMitigationPolicy)(
     PVOID lpBuffer,
     SIZE_T Length
 );
+
+typedef BOOL(WINAPI* LPFN_MINIDUMPWRITEDUMP)(
+    HANDLE hProcess,
+    DWORD ProcessId,
+    HANDLE hFile,
+    MINIDUMP_TYPE DumpType,
+    PMINIDUMP_EXCEPTION_INFORMATION ExceptionParam,
+    PMINIDUMP_USER_STREAM_INFORMATION UserStreamParam,
+    PMINIDUMP_CALLBACK_INFORMATION CallbackParam
+);
+
+struct MFT_FILE_RECORD_HEADER {
+    DWORD Magic;            // "FILE" (0x454C4946)
+    WORD  UpdateSequenceOffset;
+    WORD  UpdateSequenceSize;
+    ULONGLONG LogFileSequenceNumber;
+    WORD  SequenceNumber;
+    WORD  HardLinkCount;
+    WORD  FirstAttributeOffset;
+    WORD  Flags;            // 0x01 = In Use, 0x02 = Directory
+    DWORD RealSize;
+    DWORD AllocatedSize;
+    ULONGLONG BaseFileRecord;
+    WORD  NextAttributeId;
+} __attribute__((packed));
 
 std::string fnBytesToHex(const uint8_t* data, size_t len)
 {
@@ -90,6 +116,295 @@ bool fnMatchPattern(const char* pattern, const char* str)
         pattern++;
 
     return !*pattern && !*str;
+}
+
+ULONG fnHexDump(PUCHAR pData, ULONG nSize, int nMaxLine = -1)
+{
+    ULONG nResult = 0;
+    int nLine = 0;
+
+    for (ULONG i = 0; i < nSize; i += 16)
+    {
+        nLine++;
+
+        if (nMaxLine != -1 && nLine > nMaxLine)
+            break;
+
+        printf("%08lX |", i);
+        
+        nResult += 16;
+        for (ULONG j = 0; j < 16; j++)
+        {
+            if (i + j < nSize)
+            {
+                nResult += printf(" %02X", pData[i + j]);
+            }
+            else
+            {
+                nResult += printf(" 00");
+            }
+        }
+
+        nResult += printf(" | ");
+        for (ULONG j = 0; j < 16; j++)
+        {
+            if (i + j < nSize)
+            {
+                UCHAR k = pData[i + j];
+                char c = (k < 32 || k > 127) ? '.' : (char)k; 
+
+                nResult += printf("%c", c);
+            }
+            else
+            {
+                nResult += printf(" ");
+            }
+        }
+
+        nResult += printf("\n");
+    }
+
+    return nResult;
+}
+
+BOOL fnReadBuffer(LPCTSTR lpFilename, PUCHAR *pBuffer, PULONG pcbResult)
+{
+    HANDLE hFile;
+    LARGE_INTEGER nFileSize;
+    DWORD nBytesRead = 0;
+    BOOL bResult = FALSE;
+
+    *pBuffer = NULL;
+    if (INVALID_HANDLE_VALUE == (hFile = CreateFile(lpFilename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)))
+    {
+        std::cerr << "CreateFile() failed: " << GetLastError() << std::endl;
+        return FALSE;
+    }
+
+    if (!GetFileSizeEx(hFile, &nFileSize))
+    {
+        std::cerr << "GetFileSizeEx() failed: " << GetLastError() << std::endl;
+        goto Error_Exit;
+    }
+
+    *pBuffer = new UCHAR[(ULONG)nFileSize.QuadPart];
+    if (NULL == *pBuffer)
+    {
+        std::cerr << "Failed to allocate memory: " << GetLastError() << std::endl;
+        goto Error_Exit;
+    }
+
+    if (!ReadFile(hFile, *pBuffer, (DWORD)nFileSize.QuadPart, &nBytesRead, NULL))
+    {
+        std::cerr << "ReadFile() failed: " << GetLastError() << std::endl;
+        delete[] *pBuffer;
+        *pBuffer = NULL;
+
+        goto Error_Exit;
+    }
+
+    *pcbResult = nBytesRead;
+    bResult = TRUE;
+
+Error_Exit:
+    CloseHandle(hFile);
+    return bResult;
+}
+
+bool fnShowMftRecordInfo(const std::string& volumePath, ULONGLONG recordIndex)
+{
+    std::cout << "[*] Opening volume " << volumePath << " for MFT inspection..." << std::endl;
+
+    HANDLE hVolume = CreateFileA(
+        volumePath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+
+    if (hVolume == INVALID_HANDLE_VALUE)
+    {
+        std::cerr << "[-] Failed to open volume. Error code: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    NTFS_VOLUME_DATA_BUFFER volData = {};
+    DWORD bytesReturned = 0;
+    if (!DeviceIoControl(
+        hVolume,
+        FSCTL_GET_NTFS_VOLUME_DATA,
+        NULL, 0,
+        &volData, sizeof(volData),
+        &bytesReturned,
+        NULL))
+    {
+        std::cerr << "[-] DeviceIoControl FSCTL_GET_NTFS_VOLUME_DATA failed. Error code: " << GetLastError() << std::endl;
+        CloseHandle(hVolume);
+        return false;
+    }
+
+    DWORD bytesPerSector = volData.BytesPerSector;
+    DWORD bytesPerCluster = volData.BytesPerCluster;
+    ULONGLONG mftStartCluster = volData.MftStartLcn.QuadPart;
+    DWORD mftRecordSize = volData.BytesPerFileRecordSegment;
+
+    // Calculate absolute byte offset for the target MFT record
+    ULONGLONG mftByteOffset = (mftStartCluster * bytesPerCluster) + (recordIndex * mftRecordSize);
+
+    std::cout << "[+] NTFS Volume Metadata Retrieved Successfully:" << std::endl;
+    std::cout << "    - Bytes Per Sector: " << bytesPerSector << std::endl;
+    std::cout << "    - Bytes Per Cluster: " << bytesPerCluster << std::endl;
+    std::cout << "    - $MFT Start Cluster: 0x" << std::hex << mftStartCluster << std::dec << std::endl;
+    std::cout << "    - MFT Record Size: " << mftRecordSize << " bytes" << std::endl;
+    std::cout << "    - Target Record #" << recordIndex << " Byte Offset: 0x" << std::hex << mftByteOffset << std::dec << std::endl;
+
+    // Seek to the target MFT Record
+    LARGE_INTEGER offset;
+    offset.QuadPart = (LONGLONG)mftByteOffset;
+    if (!SetFilePointerEx(hVolume, offset, NULL, FILE_BEGIN))
+    {
+        std::cerr << "[-] Failed to seek to MFT record position. Error code: " << GetLastError() << std::endl;
+        CloseHandle(hVolume);
+        return false;
+    }
+
+    std::vector<char> recordBuffer(mftRecordSize);
+    DWORD bytesRead = 0;
+    if (!ReadFile(hVolume, recordBuffer.data(), mftRecordSize, &bytesRead, NULL) || bytesRead != mftRecordSize)
+    {
+        std::cerr << "[-] Failed to read MFT record data. Error code: " << GetLastError() << std::endl;
+        CloseHandle(hVolume);
+        return false;
+    }
+
+    CloseHandle(hVolume);
+
+    // Parse MFT Header Info
+    MFT_FILE_RECORD_HEADER* pHeader = reinterpret_cast<MFT_FILE_RECORD_HEADER*>(recordBuffer.data());
+
+    std::cout << "\n==================== MFT RECORD INFO ====================" << std::endl;
+    std::cout << "Magic Signature   : " << std::string((char*)&pHeader->Magic, 4) << (pHeader->Magic == 0x454C4946 ? " [VALID]" : " [INVALID]") << std::endl;
+    std::cout << "Sequence Number   : " << pHeader->SequenceNumber << std::endl;
+    std::cout << "Hard Link Count   : " << pHeader->HardLinkCount << std::endl;
+    std::cout << "Flags             : 0x" << std::hex << pHeader->Flags << std::dec 
+              << ((pHeader->Flags & 0x01) ? " (Allocated / In-Use)" : " (Free / Deleted)") 
+              << ((pHeader->Flags & 0x02) ? " [Directory]" : " [File]") << std::endl;
+    std::cout << "Real Size         : " << pHeader->RealSize << " bytes" << std::endl;
+    std::cout << "Allocated Size    : " << pHeader->AllocatedSize << " bytes" << std::endl;
+    std::cout << "Base File Record  : " << pHeader->BaseFileRecord << std::endl;
+    std::cout << "First Attr Offset : 0x" << std::hex << pHeader->FirstAttributeOffset << std::dec << std::endl;
+
+    // Print Raw Data (Hex Dump of the first 256 bytes)
+    std::cout << "\n===================== MFT RECORD DATA (Hex) =====================" << std::endl;
+    DWORD dumpLen = mftRecordSize < 256 ? mftRecordSize : 256;
+    for (DWORD i = 0; i < dumpLen; i++)
+    {
+        if (i % 16 == 0)
+        {
+            std::cout << std::hex << std::setw(4) << std::setfill('0') << i << "  ";
+        }
+
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (unsigned int)(unsigned char)recordBuffer[i] << " ";
+        if ((i + 1) % 16 == 0)
+        {
+            std::cout << " | ";
+            for (DWORD j = i - 15; j <= i; j++)
+            {
+                char c = recordBuffer[j];
+                std::cout << (c >= 32 && c <= 126 ? c : '.');
+            }
+
+            std::cout << std::endl;
+        }
+    }
+
+    std::cout << std::dec << "-----------------------------------------------------------------" << std::endl;
+
+    return true;
+}
+
+void fnProcessMiniDump(DWORD nProcId, const std::string& szOutputPath)
+{
+    std::cout << "[*] Opening target process (PID: " << nProcId << ")..." << std::endl;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, nProcId);
+    if (NULL == hProcess || INVALID_HANDLE_VALUE == hProcess)
+    {
+        std::cerr << "[-] Failed to open target process. Error code: " << GetLastError() << std::endl;
+        return;
+    }
+
+    HANDLE hFile = CreateFileA(
+        szOutputPath.c_str(),
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (INVALID_HANDLE_VALUE == hFile || NULL == hFile)
+    {
+        std::cerr << "[-] Failed to create output dump file. Error code: " << GetLastError() << std::endl;
+        CloseHandle(hProcess);
+
+        return;
+    }
+
+    HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+    if (!hDbgHelp)
+    {
+        std::cerr << "[-] Failed to load dbghelp.dll. Error code: " << GetLastError() << std::endl;
+        CloseHandle(hFile);
+        CloseHandle(hProcess);
+
+        return;
+    }
+
+    LPFN_MINIDUMPWRITEDUMP pMiniDumpWriteDump = (LPFN_MINIDUMPWRITEDUMP)(void*)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
+    if (!pMiniDumpWriteDump)
+    {
+        std::cerr << "[-] Failed to locate MiniDumpWriteDump entry point." << std::endl;
+        FreeLibrary(hDbgHelp);
+        CloseHandle(hFile);
+        CloseHandle(hProcess);
+
+        return;
+    }
+
+    std::cout << "[*] Generating mini-dump..." << std::endl;
+
+    MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
+        MiniDumpWithFullMemory | 
+        MiniDumpWithHandleData | 
+        MiniDumpWithUnloadedModules
+    );
+
+    BOOL bSuccess = pMiniDumpWriteDump(
+        hProcess,
+        nProcId,
+        hFile,
+        dumpType,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    if (bSuccess)
+    {
+        std::cout << "[+] Process dump successfully created at: " << szOutputPath << std::endl;
+    }
+    else
+    {
+        std::cerr << "[-] MiniDumpWriteDump failed. Error code: " << GetLastError() << std::endl;
+    }
+
+    FreeLibrary(hDbgHelp);
+    CloseHandle(hFile);
+    CloseHandle(hProcess);
 }
 
 void fnDoModuleExports(const std::string& dllPath)
@@ -1382,9 +1697,15 @@ bool fnEnableDebugPrivilege()
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Luid = luid;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    
     BOOL result = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
-    CloseHandle(hToken);
+    
+    if (result && GetLastError() == ERROR_NOT_ALL_ASSIGNED)
+    {
+        result = FALSE;
+    }
 
+    CloseHandle(hToken);
     return result;
 }
 
@@ -1447,7 +1768,16 @@ void fnPrintUsage(const char* programName)
     std::cout << "     Usage: " << prog << " --inject [DllPath] --pid [PID]\n\n";
 
     std::cout << " 15. Critical Process - Set critical process status\n";
-    std::cout << "     Usage: " << prog << " --set-critical [0|1] --pid [PID]\n";
+    std::cout << "     Usage: " << prog << " --set-critical [0|1] --pid [PID]\n\n";
+
+    std::cout << " 16. Dump Process - Set critical process status\n";
+    std::cout << "     Usage: " << prog << " --dump-proc --pid [PID] --output-path [Path]\n\n";
+
+    std::cout << " 17. Display MFT - Set critical process status\n";
+    std::cout << "     Usage: " << prog << " --mft-read \\\\.\\C: --mft-index [Index]\n\n";
+
+    std::cout << " 18. Hexdump - Display file hexdump\n";
+    std::cout << "     Usage: " << prog << " --hexdump [File]\n";
 
     std::cout << std::endl;
 }
@@ -1529,8 +1859,12 @@ int main(int argc, char *argv[])
     size_t lineCount = 0;
     uintptr_t dumpAddr = 0;
     int max_line = 100;
+    ULONGLONG mft_index = 0;
     std::string outputFormat = "raw";
     DWORD critical_status = 0;
+
+    std::string inputFile = "";
+    std::string outputFile = "";
 
     for (int i = 1; i < argc; i++)
     {
@@ -1575,6 +1909,22 @@ int main(int argc, char *argv[])
                 std::cerr << "Error: Invalid --set-critical value.\n";
                 return 1;
             }
+        }
+        else if (arg == "--output-file" && i + 1 < argc)
+        {
+            outputFile = argv[++i];
+        }
+        else if (arg == "--mft-read" && i + 1 < argc)
+        {
+            inputFile = argv[++i];
+        }
+        else if (arg == "--mft-index" && i + 1 < argc)
+        {
+            mft_index = (ULONGLONG)std::stoi(argv[++i]);
+        }
+        else if (arg == "--hexdump" && i + 1 < argc)
+        {
+            inputFile = argv[++i];
         }
     }
 
@@ -1952,14 +2302,66 @@ int main(int argc, char *argv[])
     }
     else if (arg1 == "--set-critical")
     {
-        if (argc < 3 || pid == 0)
+        if (argc < 4 || pid == 0)
         {
-            std::cerr << "Error: --set-critical requires [0|1] and --pid N\n";
+            std::cerr << "[-] Usage: " << argv[0] << " --set-critical [0|1] --pid [PID]" << std::endl;
             return 1;
         }
 
         fnDoSetCriticalStatus(critical_status, pid);
         return 0;
+    }
+    else if (arg1 == "--dump-proc")
+    {
+        if (argc < 6 || pid == 0)
+        {
+            std::cerr << "[-] Usage: " << argv[0] << " --dump-proc --pid N --output-file <Path>" << std::endl;
+            return 1;
+        }
+
+        fnProcessMiniDump(pid, outputFile);
+        return 0;
+    }
+    else if (arg1 == "--mft-read")
+    {
+        if (argc < 4)
+        {
+            std::cerr << "[-] Usage: " << argv[0] << " --mft-read \\\\.\\C: --mft-index 0" << std::endl;
+            return 1;
+        }
+
+        fnShowMftRecordInfo(inputFile, mft_index);
+        return 0;
+    }
+    else if (arg1 == "--hexdump")
+    {
+        if (argc < 4)
+        {
+
+        }
+
+        LPCTSTR lpFilename = inputFile.c_str();
+        PUCHAR pBuffer = NULL;
+        ULONG nRead = 0;
+
+        if (fnReadBuffer(lpFilename, &pBuffer, &nRead))
+        {
+            std::cout << "Read " << nRead << " bytes from file: " << inputFile << std::endl;
+            
+            if (lineCount == 0)
+                max_line = -1;
+            else
+                max_line = lineCount;
+
+            fnHexDump(pBuffer, nRead, max_line);
+            
+            return 0;
+        }
+        else
+        {
+            std::cerr << "Failed to read file: " << inputFile << std::endl;
+            return 1;
+        }
     }
 
     fnPrintUsage(argv[0]);

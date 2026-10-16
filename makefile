@@ -12,9 +12,9 @@ TARGET_X64 = bin/WinScalpel_x64.exe
 all:
 	mkdir -p bin
 	@echo "[*] Compiling x86 (32-bit) version..."
-	$(CXX_X86) $(CXXFLAGS) $(SRC_CPP) $(SRC_C32) -o $(TARGET_X86) -lversion -lpsapi
+	$(CXX_X86) $(CXXFLAGS) $(SRC_CPP) $(SRC_C32) -o $(TARGET_X86) -lversion -lpsapi -ldbghelp
 	@echo "[*] Compiling x64 (64-bit) version..."
-	$(CXX_X64) $(CXXFLAGS) $(SRC_CPP) $(SRC_C64) -o $(TARGET_X64) -lversion -lpsapi
+	$(CXX_X64) $(CXXFLAGS) $(SRC_CPP) $(SRC_C64) -o $(TARGET_X64) -lversion -lpsapi -ldbghelp
 	@echo "[+] Build completed successfully!"
 
 clean:
